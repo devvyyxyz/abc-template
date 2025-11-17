@@ -134,8 +134,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # NOTE: Use the correct create-version endpoint (v2) and send the required multipart data part "data"
-          # The project-specific route (/v2/project/{id}/version) is not valid for v2 and will return 404/not_found.
+          # Correct v2 endpoint for create-version
           API_URL="https://api.modrinth.com/v2/version"
 
           ZIP_NAME="${{ steps.package.outputs.zip }}"
@@ -175,7 +174,8 @@ jobs:
           GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
           LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
 
-          # Build the 'data' JSON payload required by Modrinth (must include project_id)
+          # Build the 'data' JSON payload required by Modrinth (must include project_id and dependencies)
+          # Note: dependencies must be an object. For datapacks you can send an empty object: {}
           DATA_JSON="$(jq -n \
             --arg project_id "${MODRINTH_PROJECT_ID}" \
             --arg name "${GITHUB_REPOSITORY##*/} ${VERSION}" \
@@ -191,6 +191,7 @@ jobs:
               changelog_type: "markdown",
               game_versions: $game_versions,
               loaders: $loaders,
+              dependencies: {},
               file_parts: ["file"],
               primary_file: "file",
               version_type: "release"
