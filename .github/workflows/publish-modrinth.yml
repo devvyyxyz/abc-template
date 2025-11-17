@@ -26,13 +26,17 @@ on:
         required: false
         default: 'minecraft'
       changelog:
-        description: 'Optional override changelog text (markdown)'
+        description: 'Optional override changelog text (markdown). If empty, the workflow will prefer the GitHub release body when available.'
         required: false
         default: ''
       version_type:
         description: 'release | beta | alpha'
         required: false
         default: 'release'
+      create_github_release:
+        description: 'If true, create a GitHub release when publishing (default: false). Guarded to avoid duplicate releases.'
+        required: false
+        default: 'false'
       dry_run:
         description: 'If true, build and validate payload but do not upload to Modrinth'
         required: false
@@ -47,6 +51,7 @@ jobs:
     env:
       MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
       MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       modrinth_version_id: ${{ steps.publish_modrinth.outputs.modrinth_version_id || '' }}
       modrinth_version_url: ${{ steps.publish_modrinth.outputs.modrinth_version_url || '' }}
@@ -60,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq zip
+          sudo apt-get install -y jq zip curl
 
       - name: Show repo root (debug)
         run: |
@@ -77,6 +82,7 @@ jobs:
           LOADERS_RAW="${{ github.event.inputs.loaders || 'minecraft' }}"
           CHANGELOG_OVERRIDE="${{ github.event.inputs.changelog || '' }}"
           VERSION_TYPE_INPUT="${{ github.event.inputs.version_type || 'release' }}"
+          CREATE_GH_RELEASE="${{ github.event.inputs.create_github_release || 'false' }}"
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           echo "datapack_input=$DATAPACK_INPUT" >> $GITHUB_OUTPUT
           echo "version_input=$VERSION_INPUT" >> $GITHUB_OUTPUT
@@ -84,6 +90,7 @@ jobs:
           echo "loaders_raw=$LOADERS_RAW" >> $GITHUB_OUTPUT
           echo "changelog_override=$CHANGELOG_OVERRIDE" >> $GITHUB_OUTPUT
           echo "version_type=$VERSION_TYPE_INPUT" >> $GITHUB_OUTPUT
+          echo "create_github_release=$CREATE_GH_RELEASE" >> $GITHUB_OUTPUT
           echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
 
       - name: Auto-detect datapack path (if needed)
@@ -91,14 +98,12 @@ jobs:
         run: |
           set -euo pipefail
           INPUT="${{ steps.inputs.outputs.datapack_input }}"
-          # If explicit path provided and exists, use it
           if [ -n "$INPUT" ] && [ -d "$INPUT" ]; then
             echo "Using provided datapack path: $INPUT"
             echo "datapack_path=$INPUT" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Prefer pack.mcmeta (typical datapack indicator)
           mapfile -d '' pmfiles < <(find . -type f -name 'pack.mcmeta' -print0 || true)
           if [ "${#pmfiles[@]}" -eq 1 ]; then
             p="${pmfiles[0]}"
@@ -116,13 +121,11 @@ jobs:
             exit 1
           fi
 
-          # Fallback: find a directory that contains a 'data' folder (typical datapack layout)
           mapfile -d '' candidates < <(find . -type d -path '*/data' -print0 || true)
           if [ "${#candidates[@]}" -gt 0 ]; then
             first="${candidates[0]}"
             root="${first%/data}"
             root="${root#./}"
-            # if root is empty, it means the repository root is the datapack
             if [ -z "$root" ]; then root="."; fi
             echo "Auto-detected datapack path by finding 'data' folder: $root"
             echo "datapack_path=$root" >> $GITHUB_OUTPUT
@@ -130,14 +133,12 @@ jobs:
           fi
 
           echo "ERROR: could not find pack.mcmeta or a 'data' folder to auto-detect a datapack."
-          echo "If your datapack is in a non-standard location, set the 'datapack_path' input when running the workflow."
           exit 1
 
       - name: Determine version string
         id: version
         run: |
           set -euo pipefail
-          # Priority: workflow_dispatch input > release.tag_name > push tag > explicit GITHUB_REF tag > git short SHA
           VERSION_INPUT="${{ steps.inputs.outputs.version_input }}"
           if [ -n "$VERSION_INPUT" ]; then
             VERSION="$VERSION_INPUT"
@@ -164,7 +165,6 @@ jobs:
             exit 0
           fi
 
-          # Fallback: short commit SHA
           VERSION="$(git rev-parse --short HEAD)"
           echo "No tag found; falling back to commit SHA: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -180,12 +180,10 @@ jobs:
             exit 1
           fi
 
-          # Ensure the zip filename contains no slashes (GITHUB_REPOSITORY is "owner/repo")
           REPO_SAFE="${GITHUB_REPOSITORY//\//-}"
           VERSION="${{ steps.version.outputs.version }}"
           ZIP_NAME="${REPO_SAFE}-datapack-${VERSION}.zip"
 
-          # Create zip in the workspace root to avoid writing outside the workspace
           rm -f "$GITHUB_WORKSPACE/$ZIP_NAME"
           (cd "$DATAPACK_PATH" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" . -x "*.git*" ) || { echo "zip failed"; exit 1; }
           echo "zip=$ZIP_NAME" >> $GITHUB_OUTPUT
@@ -201,6 +199,7 @@ jobs:
         env:
           MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
           MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -213,6 +212,7 @@ jobs:
           LOADERS_RAW="${{ steps.inputs.outputs.loaders_raw }}"
           CHANGELOG_OVERRIDE="${{ steps.inputs.outputs.changelog_override }}"
           VERSION_TYPE="${{ steps.inputs.outputs.version_type }}"
+          CREATE_GH_RELEASE="${{ steps.inputs.outputs.create_github_release }}"
           DRY_RUN="${{ steps.inputs.outputs.dry_run }}"
 
           if [ ! -f "$ZIP_PATH" ]; then
@@ -220,20 +220,45 @@ jobs:
             exit 1
           fi
 
-          # Build changelog: prefer explicit override > CHANGELOG.md > pack.mcmeta description > default
+          # Build changelog: prefer explicit override > GitHub release body (if available) > CHANGELOG.md > pack.mcmeta description > default
           if [ -n "$CHANGELOG_OVERRIDE" ]; then
             CHANGELOG="$CHANGELOG_OVERRIDE"
-          elif [ -f CHANGELOG.md ]; then
-            CHANGELOG="$(cat CHANGELOG.md)"
-          elif [ -f "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" ]; then
-            DESC="$(jq -r '.pack.description // empty' "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" 2>/dev/null || true)"
-            if [ -n "$DESC" ]; then
-              CHANGELOG="$DESC"
-            else
+          else
+            # If the workflow was triggered by a release event, prefer release.body
+            if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+              CHANGELOG="$(jq -r '.release.body // empty' "$GITHUB_EVENT_PATH" || true)"
+            fi
+
+            # If not found and we have a tag, try to fetch a GitHub release for the tag (use API)
+            if [ -z "${CHANGELOG:-}" ] && [[ "${GITHUB_REF:-}" == refs/tags/* || -n "${{ steps.version.outputs.version }}" ]]; then
+              TAG="${GITHUB_REF#refs/tags/}"
+              # if GITHUB_REF doesn't contain tag, try to use the version string directly
+              if [ -z "$TAG" ] || [ "$TAG" = "${GITHUB_REF:-}" ]; then
+                TAG="${VERSION}"
+              fi
+              # Try GET release by tag
+              OWNER_REPO="${GITHUB_REPOSITORY}"
+              GH_API_URL="https://api.github.com/repos/${OWNER_REPO}/releases/tags/${TAG}"
+              RELEASE_BODY="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "${GH_API_URL}" | jq -r '.body // empty' 2>/dev/null || true)"
+              if [ -n "$RELEASE_BODY" ]; then
+                CHANGELOG="$RELEASE_BODY"
+              fi
+            fi
+
+            if [ -z "${CHANGELOG:-}" ]; then
+              if [ -f CHANGELOG.md ]; then
+                CHANGELOG="$(cat CHANGELOG.md)"
+              elif [ -f "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" ]; then
+                DESC="$(jq -r '.pack.description // empty' "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" 2>/dev/null || true)"
+                if [ -n "$DESC" ]; then
+                  CHANGELOG="$DESC"
+                fi
+              fi
+            fi
+
+            if [ -z "${CHANGELOG:-}" ]; then
               CHANGELOG="Automated upload from GitHub Actions for version ${VERSION}"
             fi
-          else
-            CHANGELOG="Automated upload from GitHub Actions for version ${VERSION}"
           fi
 
           # Normalize token: allow secret to be stored either with or without leading "mrp_"
@@ -243,7 +268,6 @@ jobs:
           fi
 
           # Build JSON arrays robustly and output compact JSON (-c).
-          # Normalize loaders: map "data" -> "minecraft", strip empty entries, default to ["minecraft"]
           GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";"")) | map(select(length>0))')"
           LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R -s '
             split(",")
@@ -253,7 +277,6 @@ jobs:
             | if length == 0 then ["minecraft"] else . end
           ')"
 
-          # Build the 'data' JSON payload required by Modrinth.
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           DATA_JSON="$(jq -c -n \
             --arg project_id "${PROJECT_ID}" \
@@ -283,7 +306,6 @@ jobs:
           # Idempotency check: if a version with this version_number already exists for the project, skip upload.
           echo "Checking for existing version with version_number='${VERSION}'..."
           EXISTING="$(curl -sS -H "Authorization: ${TOKEN}" "https://api.modrinth.com/v2/project/${PROJECT_ID}/version" || true)"
-          # Search for a matching version_number
           if echo "$EXISTING" | jq -e --arg ver "$VERSION" '.[] | select(.version_number == $ver)' >/dev/null 2>&1; then
             EXIST_ID="$(echo "$EXISTING" | jq -r --arg ver "$VERSION" '.[] | select(.version_number == $ver) | .id' | head -n1)"
             EXIST_URL="https://modrinth.com/version/${EXIST_ID}"
@@ -312,42 +334,57 @@ jobs:
               -F "data=${DATA_JSON};type=application/json" \
               -F "file=@${ZIP_PATH}" \
               "${API_URL}" || true)"
-            # if no error field, consider success
             if ! echo "$RESPONSE" | jq -e 'has("error")' >/dev/null 2>&1; then
               break
             fi
             echo "Upload failed (attempt ${attempt}). Response: $RESPONSE" >&2
-            # exponential backoff
             sleep $((attempt * 5))
           done
 
           echo "Response: $RESPONSE"
-          # Check final response
           if echo "$RESPONSE" | jq -e 'has("error")' >/dev/null 2>&1; then
             echo "Modrinth API returned an error after ${attempt} attempts." >&2
-            # show parsed message if present
             echo "$RESPONSE" | jq -r '.description // .error // tostring' >&2 || true
             exit 1
           fi
 
-          # Parse version id and set outputs
           VERSION_ID="$(echo "$RESPONSE" | jq -r '.id // empty')"
           if [ -n "$VERSION_ID" ]; then
             VERSION_URL="https://modrinth.com/version/${VERSION_ID}"
             echo "Published Modrinth version id: $VERSION_ID"
             echo "modrinth_version_id=${VERSION_ID}" >> $GITHUB_OUTPUT
             echo "modrinth_version_url=${VERSION_URL}" >> $GITHUB_OUTPUT
-            echo "Published: ${VERSION_URL}"
-            exit 0
           else
             echo "Upload succeeded but response did not include an id. Full response:" >&2
             echo "$RESPONSE" >&2
             exit 1
           fi
 
+      - name: Optionally create GitHub release (guarded)
+        if: ${{ steps.inputs.outputs.create_github_release == 'true' && github.event_name != 'release' }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.version.outputs.version }}"
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          # Check whether a release for this tag already exists
+          HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${OWNER_REPO}/releases/tags/${TAG}" || true)"
+          if [ "$HTTP" = "200" ]; then
+            echo "A GitHub release for tag ${TAG} already exists. Skipping creation."
+            exit 0
+          fi
+          # Create release using the release body equal to the same changelog used for Modrinth
+          RELEASE_BODY="${CHANGELOG:-"Automated release for ${TAG}"}"
+          echo "Creating GitHub release ${TAG}..."
+          curl -sS -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER_REPO}/releases" \
+            -d "$(jq -n --arg tag_name "$TAG" --arg name "$TAG" --arg body "$RELEASE_BODY" '{ tag_name: $tag_name, name: $name, body: $body, draft: false, prerelease: false }')" \
+            | jq -r '.html_url // "created"'
+
       - name: Success message
         if: success()
         run: |
-          echo "Datapack uploaded to Modrinth successfully."
+          echo "Datapack process completed."
           echo "Modrinth version id: ${{ steps.publish_modrinth.outputs.modrinth_version_id }}"
           echo "Modrinth version URL: ${{ steps.publish_modrinth.outputs.modrinth_version_url }}"
