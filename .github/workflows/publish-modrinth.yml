@@ -170,13 +170,13 @@ jobs:
             TOKEN="mrp_${TOKEN}"
           fi
 
-          # Convert comma-separated inputs into JSON arrays using jq
-          GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
-          LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
+          # Build JSON arrays robustly (use -R -s so commas are handled predictably) and output compact JSON (-c)
+          GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
+          LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
 
           # Build the 'data' JSON payload required by Modrinth (must include project_id and dependencies)
-          # Note: dependencies must be an object. For datapacks you can send an empty object: {}
-          DATA_JSON="$(jq -n \
+          # Use jq -c to produce compact JSON suitable for embedding in the multipart form part.
+          DATA_JSON="$(jq -c -n \
             --arg project_id "${MODRINTH_PROJECT_ID}" \
             --arg name "${GITHUB_REPOSITORY##*/} ${VERSION}" \
             --arg version_number "${VERSION}" \
@@ -197,10 +197,13 @@ jobs:
               version_type: "release"
             }')"
 
+          echo "DATA_JSON: $DATA_JSON" >&2
+
           echo "Uploading ${ZIP_NAME} to Modrinth project ${MODRINTH_PROJECT_ID} as version ${VERSION}..."
+          # IMPORTANT: set the multipart part's type explicitly to application/json so Modrinth parses arrays correctly
           RESPONSE="$(curl -sS -X POST \
             -H "Authorization: ${TOKEN}" \
-            -F "data=${DATA_JSON}" \
+            -F "data=${DATA_JSON};type=application/json" \
             -F "file=@${ZIP_PATH}" \
             "${API_URL}" || true)"
 
