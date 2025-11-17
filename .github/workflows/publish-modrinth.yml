@@ -116,10 +116,15 @@ jobs:
             echo "ERROR: datapack path '$DATAPACK_PATH' does not exist."
             exit 1
           fi
-          ZIP_NAME="${{ github.repository }}-datapack-${{ steps.version.outputs.version }}.zip"
-          rm -f "$ZIP_NAME"
-          # Create zip from datapack root; include hidden files but exclude .git
-          (cd "$DATAPACK_PATH" && zip -r "../$ZIP_NAME" . -x "*.git*" ) || { echo "zip failed"; exit 1; }
+
+          # Ensure the zip filename contains no slashes (GITHUB_REPOSITORY is "owner/repo")
+          REPO_SAFE="${GITHUB_REPOSITORY//\//-}"
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP_NAME="${REPO_SAFE}-datapack-${VERSION}.zip"
+
+          # Create zip in the workspace root to avoid writing outside the workspace
+          rm -f "$GITHUB_WORKSPACE/$ZIP_NAME"
+          (cd "$DATAPACK_PATH" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" . -x "*.git*" ) || { echo "zip failed"; exit 1; }
           echo "zip=$ZIP_NAME" >> $GITHUB_OUTPUT
 
       - name: Publish to Modrinth
