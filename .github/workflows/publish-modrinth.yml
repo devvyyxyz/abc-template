@@ -1,0 +1,161 @@
+ url=https://github.com/devvyyxyz/abc-crafting/blob/main/.github/workflows/publish-modrinth.yml
+name: Publish datapack to Modrinth
+
+# Triggers:
+# - When a tag starting with "v" is pushed (recommended for releases)
+# - When a Release is published
+# - Manual dispatch
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      datapack_path:
+        description: 'Path to the datapack directory (relative to repo root)'
+        required: false
+        default: 'datapack'
+      game_versions:
+        description: 'Comma-separated game versions (e.g. 1.20.1,1.19.4)'
+        required: false
+        default: '1.20.1'
+      loaders:
+        description: 'Comma-separated loaders (for datapacks use "data" or leave blank if not applicable)'
+        required: false
+        default: 'data'
+
+jobs:
+  publish:
+    name: Build and publish datapack to Modrinth
+    runs-on: ubuntu-latest
+    env:
+      # These must be set in repository Secrets
+      MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
+      MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set inputs
+        id: inputs
+        run: |
+          # Use workflow_dispatch inputs or defaults
+          DATAPACK_PATH="${{ github.event.inputs.datapack_path || 'datapack' }}"
+          GAME_VERSIONS="${{ github.event.inputs.game_versions || '1.20.1' }}"
+          LOADERS="${{ github.event.inputs.loaders || 'data' }}"
+          echo "datapack_path=$DATAPACK_PATH" >> $GITHUB_OUTPUT
+          echo "game_versions=$GAME_VERSIONS" >> $GITHUB_OUTPUT
+          echo "loaders=$LOADERS" >> $GITHUB_OUTPUT
+
+      - name: Determine version string
+        id: version
+        run: |
+          # Prefer tag name (strip leading 'v' if present), otherwise use short SHA
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+            # strip leading v if present
+            VERSION="${RAW_TAG#v}"
+          else
+            VERSION="$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create zip of datapack
+        id: package
+        run: |
+          DATAPACK_PATH="${{ steps.inputs.outputs.datapack_path }}"
+          if [ ! -d "$DATAPACK_PATH" ]; then
+            echo "ERROR: datapack path '$DATAPACK_PATH' does not exist."
+            exit 1
+          fi
+          ZIP_NAME="datapack-${{ steps.version.outputs.version }}.zip"
+          # create zip (preserve directory structure inside zip)
+          cd "$DATAPACK_PATH"
+          zip -r "../$ZIP_NAME" . -x "*.git*"
+          cd -
+          echo "zip=$ZIP_NAME" >> $GITHUB_OUTPUT
+
+      - name: Publish to Modrinth
+        env:
+          MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          API_URL="https://api.modrinth.com/v2/project/${MODRINTH_PROJECT_ID}/version"
+          ZIP_NAME="${{ steps.package.outputs.zip }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          GAME_VERSIONS_RAW="${{ steps.inputs.outputs.game_versions }}"
+          LOADERS_RAW="${{ steps.inputs.outputs.loaders }}"
+
+          # Build changelog: prefer CHANGELOG.md at repo root, otherwise auto message
+          if [ -f CHANGELOG.md ]; then
+            CHANGELOG="$(cat CHANGELOG.md)"
+          else
+            CHANGELOG="Automated upload from GitHub Actions for version ${VERSION}"
+          fi
+
+          # Start building curl command
+          # We use multipart/form-data fields documented by Modrinth API:
+          # - version_number (string)
+          # - changelog (string)
+          # - changelog_type (markdown/plain)
+          # - game_versions[] (multiple allowed)
+          # - loaders[] (multiple allowed)
+          # - file (the uploaded file)
+          # NOTE: adapt game_versions and loaders to suit your project.
+
+          CURL_CMD=(curl -sS -X POST -H "Authorization: ${MODRINTH_API_TOKEN}")
+
+          # Add basic fields
+          CURL_CMD+=(-F "version_number=${VERSION}")
+          CURL_CMD+=(-F "changelog=${CHANGELOG}")
+          CURL_CMD+=(-F "changelog_type=markdown")
+
+          # Add game_versions entries (split comma-separated)
+          IFS=',' read -ra GAMES <<< "$GAME_VERSIONS_RAW"
+          for g in "${GAMES[@]}"; do
+            trimmed="$(echo "$g" | xargs)"
+            if [ -n "$trimmed" ]; then
+              CURL_CMD+=(-F "game_versions[]=${trimmed}")
+            fi
+          done
+
+          # Add loaders entries (split comma-separated) if provided
+          IFS=',' read -ra LDRS <<< "$LOADERS_RAW"
+          for l in "${LDRS[@]}"; do
+            trimmed="$(echo "$l" | xargs)"
+            if [ -n "$trimmed" ]; then
+              CURL_CMD+=(-F "loaders[]=${trimmed}")
+            fi
+          done
+
+          # Attach the file
+          CURL_CMD+=(-F "file=@${ZIP_NAME}")
+
+          # Final endpoint
+          CURL_CMD+=("${API_URL}")
+
+          echo "Uploading ${ZIP_NAME} to Modrinth project ${MODRINTH_PROJECT_ID} as version ${VERSION}..."
+          # Execute and capture response
+          RESPONSE="$("${CURL_CMD[@]}" || true)"
+          echo "Response: $RESPONSE"
+          # exit non-zero if response contains error-like fields (simple check)
+          if echo "$RESPONSE" | grep -qi '"error"'; then
+            echo "Modrinth API returned an error."
+            exit 1
+          fi
+
+      - name: Success message
+        if: success()
+        run: |
+          echo "Datapack uploaded to Modrinth successfully (response shown above)."
+
+# Notes:
+# - You MUST add two repository Secrets: MODRINTH_API_TOKEN and MODRINTH_PROJECT_ID.
+#   - MODRINTH_API_TOKEN: a Modrinth account token with permission to create versions on the target project.
+#   - MODRINTH_PROJECT_ID: the Modrinth project ID (not slug) of your datapack project.
+# - Adjust the defaults (game_versions, loaders, datapack_path) to match your datapack.
+# - This workflow triggers on tags like v1.2.3, releases, or can be manually run.
+# - The Modrinth API accepts multipart/form-data; fields used here are common, but adapt to your project metadata needs.
