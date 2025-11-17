@@ -18,9 +18,9 @@ on:
         required: false
         default: '1.20.1'
       loaders:
-        description: 'Comma-separated loaders (for datapacks use "data")'
+        description: 'Comma-separated loaders (for datapacks use "minecraft")'
         required: false
-        default: 'data'
+        default: 'minecraft'
 
 jobs:
   publish:
@@ -43,7 +43,8 @@ jobs:
         run: |
           DATAPACK_INPUT="${{ github.event.inputs.datapack_path || '' }}"
           GAME_VERSIONS="${{ github.event.inputs.game_versions || '1.20.1' }}"
-          LOADERS="${{ github.event.inputs.loaders || 'data' }}"
+          # default changed to minecraft; we still accept user input but normalize later
+          LOADERS="${{ github.event.inputs.loaders || 'minecraft' }}"
           echo "datapack_input=$DATAPACK_INPUT" >> $GITHUB_OUTPUT
           echo "game_versions=$GAME_VERSIONS" >> $GITHUB_OUTPUT
           echo "loaders=$LOADERS" >> $GITHUB_OUTPUT
@@ -170,16 +171,21 @@ jobs:
             TOKEN="mrp_${TOKEN}"
           fi
 
-          # Build JSON arrays robustly and output compact JSON (-c)
-          GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
-          LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
+          # Build JSON arrays robustly and output compact JSON (-c).
+          # Normalize loaders: map "data" -> "minecraft", strip empty entries, and default to ["minecraft"] if list is empty.
+          GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";"")) | map(select(length>0))')"
+          LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R -s '
+            split(",")
+            | map(.|gsub("^\\s+|\\s+$";""))
+            | map(select(length>0))
+            | map(if . == "data" then "minecraft" else . end)
+            | if length == 0 then ["minecraft"] else . end
+          ')"
 
           # Use the repository name dynamically for the version "name"
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
 
           # Build the 'data' JSON payload required by Modrinth.
-          # NOTE: dependencies is an empty array here per your fix.
-          # Add the required "featured" field (boolean). Default false for non-featured uploads.
           DATA_JSON="$(jq -c -n \
             --arg project_id "${MODRINTH_PROJECT_ID}" \
             --arg name "${REPO_NAME} ${VERSION}" \
