@@ -133,18 +133,27 @@ jobs:
           MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
         run: |
           set -euo pipefail
-          API_URL="https://api.modrinth.com/v2/project/${MODRINTH_PROJECT_ID}/version"
+
+          # NOTE: Use the correct create-version endpoint (v2) and send the required multipart data part "data"
+          # The project-specific route (/v2/project/{id}/version) is not valid for v2 and will return 404/not_found.
+          API_URL="https://api.modrinth.com/v2/version"
+
           ZIP_NAME="${{ steps.package.outputs.zip }}"
+          ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_NAME"
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "ERROR: zip file not found at $ZIP_PATH"
+            exit 1
+          fi
+
           VERSION="${{ steps.version.outputs.version }}"
           GAME_VERSIONS_RAW="${{ steps.inputs.outputs.game_versions }}"
           LOADERS_RAW="${{ steps.inputs.outputs.loaders }}"
 
+          # Build changelog (reuse same logic as before)
           if [ -f CHANGELOG.md ]; then
             CHANGELOG="$(cat CHANGELOG.md)"
           else
-            # Attempt to use pack.mcmeta description if present
             if [ -f "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" ]; then
-              # extract description field if in JSON; fallback to generic message
               DESC="$(jq -r '.pack.description // empty' "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" 2>/dev/null || true)"
               if [ -n "$DESC" ]; then
                 CHANGELOG="$DESC"
@@ -156,32 +165,44 @@ jobs:
             fi
           fi
 
-          CURL_CMD=(curl -sS -X POST -H "Authorization: ${MODRINTH_API_TOKEN}")
-          CURL_CMD+=(-F "version_number=${VERSION}")
-          CURL_CMD+=(-F "changelog=${CHANGELOG}")
-          CURL_CMD+=(-F "changelog_type=markdown")
+          # Normalize token: allow secret to be stored either with or without leading "mrp_"
+          TOKEN="${MODRINTH_API_TOKEN}"
+          if [[ "$TOKEN" != mrp_* ]]; then
+            TOKEN="mrp_${TOKEN}"
+          fi
 
-          IFS=',' read -ra GAMES <<< "$GAME_VERSIONS_RAW"
-          for g in "${GAMES[@]}"; do
-            trimmed="$(echo "$g" | xargs)"
-            if [ -n "$trimmed" ]; then
-              CURL_CMD+=(-F "game_versions[]=${trimmed}")
-            fi
-          done
+          # Convert comma-separated inputs into JSON arrays using jq
+          GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
+          LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
 
-          IFS=',' read -ra LDRS <<< "$LOADERS_RAW"
-          for l in "${LDRS[@]}"; do
-            trimmed="$(echo "$l" | xargs)"
-            if [ -n "$trimmed" ]; then
-              CURL_CMD+=(-F "loaders[]=${trimmed}")
-            fi
-          done
-
-          CURL_CMD+=(-F "file=@${ZIP_NAME}")
-          CURL_CMD+=("${API_URL}")
+          # Build the 'data' JSON payload required by Modrinth (must include project_id)
+          DATA_JSON="$(jq -n \
+            --arg project_id "${MODRINTH_PROJECT_ID}" \
+            --arg name "${GITHUB_REPOSITORY##*/} ${VERSION}" \
+            --arg version_number "${VERSION}" \
+            --arg changelog "${CHANGELOG}" \
+            --argjson game_versions "${GAME_JSON}" \
+            --argjson loaders "${LOADERS_JSON}" \
+            '{
+              project_id: $project_id,
+              name: $name,
+              version_number: $version_number,
+              changelog: $changelog,
+              changelog_type: "markdown",
+              game_versions: $game_versions,
+              loaders: $loaders,
+              file_parts: ["file"],
+              primary_file: "file",
+              version_type: "release"
+            }')"
 
           echo "Uploading ${ZIP_NAME} to Modrinth project ${MODRINTH_PROJECT_ID} as version ${VERSION}..."
-          RESPONSE="$("${CURL_CMD[@]}" || true)"
+          RESPONSE="$(curl -sS -X POST \
+            -H "Authorization: ${TOKEN}" \
+            -F "data=${DATA_JSON}" \
+            -F "file=@${ZIP_PATH}" \
+            "${API_URL}" || true)"
+
           echo "Response: $RESPONSE"
           if echo "$RESPONSE" | grep -qi '"error"'; then
             echo "Modrinth API returned an error."
