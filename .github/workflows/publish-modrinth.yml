@@ -1,4 +1,3 @@
- url=https://github.com/devvyyxyz/abc-crafting/blob/main/.github/workflows/publish-modrinth.yml
 name: Publish datapack to Modrinth
 
 # Triggers:
