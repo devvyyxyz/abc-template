@@ -1,9 +1,6 @@
 name: Publish datapack to Modrinth
 
-# Triggers:
-# - When a tag starting with "v" is pushed (recommended for releases)
-# - When a Release is published
-# - Manual dispatch
+# Triggers: tag pushes (v*), release published, or manual dispatch (with inputs)
 on:
   push:
     tags:
@@ -13,15 +10,15 @@ on:
   workflow_dispatch:
     inputs:
       datapack_path:
-        description: 'Path to the datapack directory (relative to repo root)'
+        description: 'Path to the datapack directory (relative to repo root). If blank the workflow will try to auto-detect.'
         required: false
-        default: 'datapack'
+        default: ''
       game_versions:
         description: 'Comma-separated game versions (e.g. 1.20.1,1.19.4)'
         required: false
         default: '1.20.1'
       loaders:
-        description: 'Comma-separated loaders (for datapacks use "data" or leave blank if not applicable)'
+        description: 'Comma-separated loaders (for datapacks use "data")'
         required: false
         default: 'data'
 
@@ -30,31 +27,79 @@ jobs:
     name: Build and publish datapack to Modrinth
     runs-on: ubuntu-latest
     env:
-      # These must be set in repository Secrets
       MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
       MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Show repo root (debug)
+        run: |
+          echo "Repository tree (top 4 levels):"
+          find . -maxdepth 4 -not -path './.git*' -print | sed 's|^\./||' || true
+
       - name: Set inputs
         id: inputs
         run: |
-          # Use workflow_dispatch inputs or defaults
-          DATAPACK_PATH="${{ github.event.inputs.datapack_path || 'datapack' }}"
+          DATAPACK_INPUT="${{ github.event.inputs.datapack_path || '' }}"
           GAME_VERSIONS="${{ github.event.inputs.game_versions || '1.20.1' }}"
           LOADERS="${{ github.event.inputs.loaders || 'data' }}"
-          echo "datapack_path=$DATAPACK_PATH" >> $GITHUB_OUTPUT
+          echo "datapack_input=$DATAPACK_INPUT" >> $GITHUB_OUTPUT
           echo "game_versions=$GAME_VERSIONS" >> $GITHUB_OUTPUT
           echo "loaders=$LOADERS" >> $GITHUB_OUTPUT
+
+      - name: Auto-detect datapack path (if needed)
+        id: detect
+        run: |
+          set -euo pipefail
+          INPUT="${{ steps.inputs.outputs.datapack_input }}"
+          # If explicit path provided and exists, use it
+          if [ -n "$INPUT" ] && [ -d "$INPUT" ]; then
+            echo "Using provided datapack path: $INPUT"
+            echo "datapack_path=$INPUT" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Prefer pack.mcmeta (typical datapack indicator)
+          mapfile -d '' pmfiles < <(find . -type f -name 'pack.mcmeta' -print0 || true)
+          if [ "${#pmfiles[@]}" -eq 1 ]; then
+            p="${pmfiles[0]}"
+            dir="$(dirname "$p")"
+            dir="${dir#./}"
+            echo "Auto-detected datapack path from pack.mcmeta: $dir"
+            echo "datapack_path=$dir" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "${#pmfiles[@]}" -gt 1 ]; then
+            echo "Multiple pack.mcmeta files found:"
+            for f in "${pmfiles[@]}"; do echo " - ${f#./}"; done
+            echo "Please provide datapack_path input to disambiguate."
+            exit 1
+          fi
+
+          # Fallback: find a directory that contains a 'data' folder (typical datapack layout)
+          mapfile -d '' candidates < <(find . -type d -path '*/data' -print0 || true)
+          if [ "${#candidates[@]}" -gt 0 ]; then
+            first="${candidates[0]}"
+            root="${first%/data}"
+            root="${root#./}"
+            # if root is empty, it means the repository root is the datapack
+            if [ -z "$root" ]; then root="."; fi
+            echo "Auto-detected datapack path by finding 'data' folder: $root"
+            echo "datapack_path=$root" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "ERROR: could not find pack.mcmeta or a 'data' folder to auto-detect a datapack."
+          echo "If your datapack is in a non-standard location, set the 'datapack_path' input when running the workflow."
+          exit 1
 
       - name: Determine version string
         id: version
         run: |
-          # Prefer tag name (strip leading 'v' if present), otherwise use short SHA
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             RAW_TAG="${GITHUB_REF#refs/tags/}"
-            # strip leading v if present
             VERSION="${RAW_TAG#v}"
           else
             VERSION="$(git rev-parse --short HEAD)"
@@ -64,16 +109,17 @@ jobs:
       - name: Create zip of datapack
         id: package
         run: |
-          DATAPACK_PATH="${{ steps.inputs.outputs.datapack_path }}"
-          if [ ! -d "$DATAPACK_PATH" ]; then
+          set -euo pipefail
+          DATAPACK_PATH="${{ steps.detect.outputs.datapack_path }}"
+          echo "Datapack path to package: $DATAPACK_PATH"
+          if [ -z "$DATAPACK_PATH" ] || [ ! -d "$DATAPACK_PATH" ]; then
             echo "ERROR: datapack path '$DATAPACK_PATH' does not exist."
             exit 1
           fi
-          ZIP_NAME="datapack-${{ steps.version.outputs.version }}.zip"
-          # create zip (preserve directory structure inside zip)
-          cd "$DATAPACK_PATH"
-          zip -r "../$ZIP_NAME" . -x "*.git*"
-          cd -
+          ZIP_NAME="${{ github.repository }}-datapack-${{ steps.version.outputs.version }}.zip"
+          rm -f "$ZIP_NAME"
+          # Create zip from datapack root; include hidden files but exclude .git
+          (cd "$DATAPACK_PATH" && zip -r "../$ZIP_NAME" . -x "*.git*" ) || { echo "zip failed"; exit 1; }
           echo "zip=$ZIP_NAME" >> $GITHUB_OUTPUT
 
       - name: Publish to Modrinth
@@ -88,31 +134,28 @@ jobs:
           GAME_VERSIONS_RAW="${{ steps.inputs.outputs.game_versions }}"
           LOADERS_RAW="${{ steps.inputs.outputs.loaders }}"
 
-          # Build changelog: prefer CHANGELOG.md at repo root, otherwise auto message
           if [ -f CHANGELOG.md ]; then
             CHANGELOG="$(cat CHANGELOG.md)"
           else
-            CHANGELOG="Automated upload from GitHub Actions for version ${VERSION}"
+            # Attempt to use pack.mcmeta description if present
+            if [ -f "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" ]; then
+              # extract description field if in JSON; fallback to generic message
+              DESC="$(jq -r '.pack.description // empty' "${{ steps.detect.outputs.datapack_path }}/pack.mcmeta" 2>/dev/null || true)"
+              if [ -n "$DESC" ]; then
+                CHANGELOG="$DESC"
+              else
+                CHANGELOG="Automated upload from GitHub Actions for version ${VERSION}"
+              fi
+            else
+              CHANGELOG="Automated upload from GitHub Actions for version ${VERSION}"
+            fi
           fi
 
-          # Start building curl command
-          # We use multipart/form-data fields documented by Modrinth API:
-          # - version_number (string)
-          # - changelog (string)
-          # - changelog_type (markdown/plain)
-          # - game_versions[] (multiple allowed)
-          # - loaders[] (multiple allowed)
-          # - file (the uploaded file)
-          # NOTE: adapt game_versions and loaders to suit your project.
-
           CURL_CMD=(curl -sS -X POST -H "Authorization: ${MODRINTH_API_TOKEN}")
-
-          # Add basic fields
           CURL_CMD+=(-F "version_number=${VERSION}")
           CURL_CMD+=(-F "changelog=${CHANGELOG}")
           CURL_CMD+=(-F "changelog_type=markdown")
 
-          # Add game_versions entries (split comma-separated)
           IFS=',' read -ra GAMES <<< "$GAME_VERSIONS_RAW"
           for g in "${GAMES[@]}"; do
             trimmed="$(echo "$g" | xargs)"
@@ -121,7 +164,6 @@ jobs:
             fi
           done
 
-          # Add loaders entries (split comma-separated) if provided
           IFS=',' read -ra LDRS <<< "$LOADERS_RAW"
           for l in "${LDRS[@]}"; do
             trimmed="$(echo "$l" | xargs)"
@@ -130,17 +172,12 @@ jobs:
             fi
           done
 
-          # Attach the file
           CURL_CMD+=(-F "file=@${ZIP_NAME}")
-
-          # Final endpoint
           CURL_CMD+=("${API_URL}")
 
           echo "Uploading ${ZIP_NAME} to Modrinth project ${MODRINTH_PROJECT_ID} as version ${VERSION}..."
-          # Execute and capture response
           RESPONSE="$("${CURL_CMD[@]}" || true)"
           echo "Response: $RESPONSE"
-          # exit non-zero if response contains error-like fields (simple check)
           if echo "$RESPONSE" | grep -qi '"error"'; then
             echo "Modrinth API returned an error."
             exit 1
@@ -148,13 +185,4 @@ jobs:
 
       - name: Success message
         if: success()
-        run: |
-          echo "Datapack uploaded to Modrinth successfully (response shown above)."
-
-# Notes:
-# - You MUST add two repository Secrets: MODRINTH_API_TOKEN and MODRINTH_PROJECT_ID.
-#   - MODRINTH_API_TOKEN: a Modrinth account token with permission to create versions on the target project.
-#   - MODRINTH_PROJECT_ID: the Modrinth project ID (not slug) of your datapack project.
-# - Adjust the defaults (game_versions, loaders, datapack_path) to match your datapack.
-# - This workflow triggers on tags like v1.2.3, releases, or can be manually run.
-# - The Modrinth API accepts multipart/form-data; fields used here are common, but adapt to your project metadata needs.
+        run: echo "Datapack uploaded to Modrinth successfully."
