@@ -179,6 +179,7 @@ jobs:
 
           # Build the 'data' JSON payload required by Modrinth.
           # NOTE: dependencies is an empty array here per your fix.
+          # Add the required "featured" field (boolean). Default false for non-featured uploads.
           DATA_JSON="$(jq -c -n \
             --arg project_id "${MODRINTH_PROJECT_ID}" \
             --arg name "${REPO_NAME} ${VERSION}" \
@@ -197,7 +198,8 @@ jobs:
               dependencies: [],
               file_parts: ["file"],
               primary_file: "file",
-              version_type: "release"
+              version_type: "release",
+              featured: false
             }')"
 
           # Debug print to help diagnose API parsing errors in logs
