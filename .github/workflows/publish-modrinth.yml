@@ -220,23 +220,30 @@ jobs:
             exit 1
           fi
 
-          # Build changelog: prefer explicit override > GitHub release body (if available) > CHANGELOG.md > pack.mcmeta description > default
+          # Guard: if this run is a push tag and a GitHub release for this tag already exists,
+          # skip to avoid double uploads (push->tag then release.published both fire).
+          if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" || true)"
+            if [ "$HTTP" = "200" ]; then
+              echo "A GitHub release for tag ${TAG} already exists. Skipping upload to avoid duplicate."
+              exit 0
+            fi
+          fi
+
+          # Build changelog: prefer explicit override > GitHub release body (if available) > release by tag > CHANGELOG.md > pack.mcmeta description > default
           if [ -n "$CHANGELOG_OVERRIDE" ]; then
             CHANGELOG="$CHANGELOG_OVERRIDE"
           else
-            # If the workflow was triggered by a release event, prefer release.body
             if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
               CHANGELOG="$(jq -r '.release.body // empty' "$GITHUB_EVENT_PATH" || true)"
             fi
 
-            # If not found and we have a tag, try to fetch a GitHub release for the tag (use API)
             if [ -z "${CHANGELOG:-}" ] && [[ "${GITHUB_REF:-}" == refs/tags/* || -n "${{ steps.version.outputs.version }}" ]]; then
               TAG="${GITHUB_REF#refs/tags/}"
-              # if GITHUB_REF doesn't contain tag, try to use the version string directly
               if [ -z "$TAG" ] || [ "$TAG" = "${GITHUB_REF:-}" ]; then
                 TAG="${VERSION}"
               fi
-              # Try GET release by tag
               OWNER_REPO="${GITHUB_REPOSITORY}"
               GH_API_URL="https://api.github.com/repos/${OWNER_REPO}/releases/tags/${TAG}"
               RELEASE_BODY="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "${GH_API_URL}" | jq -r '.body // empty' 2>/dev/null || true)"
@@ -303,16 +310,50 @@ jobs:
 
           echo "DATA_JSON: $DATA_JSON" >&2
 
-          # Idempotency check: if a version with this version_number already exists for the project, skip upload.
-          echo "Checking for existing version with version_number='${VERSION}'..."
+          # Idempotency check: if a version with this version_number already exists for the project, try to detect same file (checksum),
+          # otherwise skip to avoid duplicate version_numbers
+          echo "Checking for existing versions for project..."
           EXISTING="$(curl -sS -H "Authorization: ${TOKEN}" "https://api.modrinth.com/v2/project/${PROJECT_ID}/version" || true)"
+
+          # If there's any existing version with our version number, inspect files and compare checksums (optional).
           if echo "$EXISTING" | jq -e --arg ver "$VERSION" '.[] | select(.version_number == $ver)' >/dev/null 2>&1; then
+            echo "Found existing version(s) with same version_number. Checking file checksums..."
+            # compute local checksum
+            if command -v sha256sum >/dev/null 2>&1; then
+              LOCAL_SHA256="$(sha256sum "$ZIP_PATH" | awk '{print $1}')"
+            else
+              LOCAL_SHA256="$(openssl dgst -sha256 "$ZIP_PATH" | awk '{print $2}')"
+            fi
+
+            MATCH=""
+            # iterate matching versions, fetch full version detail to inspect files/hashes
+            echo "$EXISTING" | jq -r --arg ver "$VERSION" '.[] | select(.version_number == $ver) | .id' | while read -r id; do
+              if [ -n "$id" ]; then
+                VER_JSON="$(curl -sS -H "Authorization: ${TOKEN}" "https://api.modrinth.com/v2/version/$id" || true)"
+                # Try to find sha256 in returned hashes; Modrinth may include sha1/sha512/sha256 keys depending on API; check common locations
+                # This attempts to find any file hash that equals LOCAL_SHA256
+                if echo "$VER_JSON" | jq -e --arg want "$LOCAL_SHA256" '.files[]?.hashes? | .. | select(type=="string") | select(. == $want)' >/dev/null 2>&1; then
+                  MATCH="$id"
+                  echo "Matching file found in existing Modrinth version: $id"
+                  echo "modrinth_version_id=$id" >> $GITHUB_OUTPUT
+                  echo "modrinth_version_url=https://modrinth.com/version/$id" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+              fi
+            done
+
+            if [ -n "$MATCH" ]; then
+              echo "An identical file already exists on Modrinth (version id: $MATCH). Skipping upload."
+              exit 0
+            fi
+
+            # If we got here, no identical file found, but a version_number collision exists — still skip to avoid duplicate versions.
+            echo "Version number '${VERSION}' already exists but files differ. To avoid duplicate version numbers, skipping upload. Consider bumping version."
             EXIST_ID="$(echo "$EXISTING" | jq -r --arg ver "$VERSION" '.[] | select(.version_number == $ver) | .id' | head -n1)"
             EXIST_URL="https://modrinth.com/version/${EXIST_ID}"
-            echo "Found existing Modrinth version with same version_number: ${EXIST_ID} -> ${EXIST_URL}"
+            echo "Existing Modrinth version: ${EXIST_ID} -> ${EXIST_URL}"
             echo "modrinth_version_id=${EXIST_ID}" >> $GITHUB_OUTPUT
             echo "modrinth_version_url=${EXIST_URL}" >> $GITHUB_OUTPUT
-            echo "Skipping upload to avoid duplicate."
             exit 0
           fi
 
