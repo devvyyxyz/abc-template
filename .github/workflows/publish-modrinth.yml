@@ -170,15 +170,18 @@ jobs:
             TOKEN="mrp_${TOKEN}"
           fi
 
-          # Build JSON arrays robustly (use -R -s so commas are handled predictably) and output compact JSON (-c)
+          # Build JSON arrays robustly and output compact JSON (-c)
           GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
           LOADERS_JSON="$(printf '%s' "$LOADERS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";""))')"
 
-          # Build the 'data' JSON payload required by Modrinth (must include project_id and dependencies)
-          # Use jq -c to produce compact JSON suitable for embedding in the multipart form part.
+          # Use the repository name dynamically for the version "name"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+
+          # Build the 'data' JSON payload required by Modrinth.
+          # NOTE: dependencies is an empty array here per your fix.
           DATA_JSON="$(jq -c -n \
             --arg project_id "${MODRINTH_PROJECT_ID}" \
-            --arg name "${GITHUB_REPOSITORY##*/} ${VERSION}" \
+            --arg name "${REPO_NAME} ${VERSION}" \
             --arg version_number "${VERSION}" \
             --arg changelog "${CHANGELOG}" \
             --argjson game_versions "${GAME_JSON}" \
@@ -191,16 +194,17 @@ jobs:
               changelog_type: "markdown",
               game_versions: $game_versions,
               loaders: $loaders,
-              dependencies: {},
+              dependencies: [],
               file_parts: ["file"],
               primary_file: "file",
               version_type: "release"
             }')"
 
+          # Debug print to help diagnose API parsing errors in logs
           echo "DATA_JSON: $DATA_JSON" >&2
 
           echo "Uploading ${ZIP_NAME} to Modrinth project ${MODRINTH_PROJECT_ID} as version ${VERSION}..."
-          # IMPORTANT: set the multipart part's type explicitly to application/json so Modrinth parses arrays correctly
+          # Send the 'data' part explicitly as application/json so arrays are parsed correctly server-side
           RESPONSE="$(curl -sS -X POST \
             -H "Authorization: ${TOKEN}" \
             -F "data=${DATA_JSON};type=application/json" \
