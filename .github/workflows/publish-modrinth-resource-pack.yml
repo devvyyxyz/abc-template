@@ -1,0 +1,757 @@
+name: Publish resource pack to Modrinth
+
+# HELP: Workflow dispatch options
+# - This workflow can run on tag pushes (v*), on GitHub release published events,
+#   or manually via workflow_dispatch. When run manually you can override values
+#   below. Several inputs are shared between GitHub and Modrinth so provide them
+#   once when running manually:
+#   - `version` -> used as Git tag (prefixed with `v` when necessary) and
+#       Modrinth `version_number`.
+#   - `release_name` and `changelog` -> used as both GitHub release title/body
+#       and Modrinth version `name`/`changelog` unless explicit overrides are set.
+#   - `modrinth_project_id` -> optional override for the project id (otherwise
+#       the `MODRINTH_PROJECT_ID` secret is used).
+#
+# Dispatch guidance:
+# - For consistent names between GitHub and Modrinth, push a tag (vX.Y.Z) or
+#   provide `create_github_release=true` when dispatching and set `release_name`.
+# - `game_versions` will be auto-detected from `pack.mcmeta` when present;
+#   otherwise it defaults sensibly.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      # Files & targets
+      resourcepack_path:
+        description: 'Path to the resource-pack directory (relative to repo root). If blank the workflow will try to auto-detect.'
+        required: false
+        default: ''
+      modrinth_project_id:
+        description: 'Optional Modrinth project id override. If blank the workflow will use the secret MODRINTH_PROJECT_ID.'
+        required: false
+        default: ''
+
+      # Versioning (shared between GitHub and Modrinth)
+      version:
+        description: 'Optional explicit version string. This will be used as the Git tag (prefixed with v when necessary) and as the Modrinth version_number. If blank the workflow will prefer the pushed tag, release tag, or commit SHA.'
+        required: false
+        default: ''
+      release_name:
+        description: 'Optional explicit release name/title. This will be used as both the GitHub release title and the Modrinth version name when provided. If empty the workflow will prefer an existing release title or fall back to "<repo> <tag>".'
+        required: false
+        default: ''
+      create_github_release:
+        description: 'If true, create a GitHub release when publishing. When a tag is pushed the workflow will create or attach to a GitHub release to guarantee consistent names between GitHub and Modrinth.'
+        required: false
+        default: 'false'
+
+      # Release metadata (shared)
+      version_type:
+        description: 'release | beta | alpha'
+        required: false
+        default: 'release'
+      featured:
+        description: 'If true, mark the Modrinth version as featured.'
+        required: false
+        default: 'false'
+      changelog:
+        description: 'Optional override changelog text (markdown). This will be used as both the GitHub release body and the Modrinth changelog/description. If empty, the workflow will prefer the GitHub release body, CHANGELOG.md, or pack.mcmeta description.'
+        required: false
+        default: ''
+      changelog_type:
+        description: 'Changelog type sent to Modrinth: markdown or text. Defaults to markdown.'
+        required: false
+        default: 'markdown'
+
+      # Modrinth / compatibility
+      game_versions:
+        description: 'Comma-separated game versions for Modrinth (e.g. 1.21.4,1.20.1). If pack.mcmeta is present the workflow will try to auto-detect and override this value.'
+        required: false
+        default: '1.21.4'
+
+      # Run mode
+      dry_run:
+        description: 'If true, build and validate payload but do not upload to Modrinth'
+        required: false
+        default: 'false'
+
+jobs:
+  publish:
+    name: Build and publish resource pack to Modrinth
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
+      MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      modrinth_version_id: ${{ steps.publish_modrinth.outputs.modrinth_version_id || '' }}
+      modrinth_version_url: ${{ steps.publish_modrinth.outputs.modrinth_version_url || '' }}
+    steps:
+      - name: Checkout repository (full history & tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure required tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq zip curl
+
+      - name: Show repo root (debug)
+        run: |
+          echo "Repository tree (top 4 levels):"
+          find . -maxdepth 4 -not -path './.git*' -print | sed 's|^\./||' || true
+
+      - name: Set inputs
+        id: inputs
+        run: |
+          set -euo pipefail
+          RESOURCEPACK_INPUT="${{ github.event.inputs.resourcepack_path || '' }}"
+          VERSION_INPUT="${{ github.event.inputs.version || '' }}"
+          GAME_VERSIONS="${{ github.event.inputs.game_versions || '1.21.4' }}"
+          CHANGELOG_OVERRIDE="${{ github.event.inputs.changelog || '' }}"
+          VERSION_TYPE_INPUT="${{ github.event.inputs.version_type || 'release' }}"
+          CREATE_GH_RELEASE="${{ github.event.inputs.create_github_release || 'false' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          RELEASE_NAME_INPUT="${{ github.event.inputs.release_name || '' }}"
+          MODRINTH_PROJECT_ID_INPUT="${{ github.event.inputs.modrinth_project_id || '' }}"
+          FEATURED_INPUT="${{ github.event.inputs.featured || 'false' }}"
+          CHANGELOG_TYPE_INPUT="${{ github.event.inputs.changelog_type || 'markdown' }}"
+          echo "resourcepack_input=$RESOURCEPACK_INPUT" >> $GITHUB_OUTPUT
+          echo "version_input=$VERSION_INPUT" >> $GITHUB_OUTPUT
+          echo "game_versions=$GAME_VERSIONS" >> $GITHUB_OUTPUT
+          echo "changelog_override=$CHANGELOG_OVERRIDE" >> $GITHUB_OUTPUT
+          echo "version_type=$VERSION_TYPE_INPUT" >> $GITHUB_OUTPUT
+          echo "create_github_release=$CREATE_GH_RELEASE" >> $GITHUB_OUTPUT
+          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
+          echo "release_name_input=$RELEASE_NAME_INPUT" >> $GITHUB_OUTPUT
+          echo "modrinth_project_id_input=$MODRINTH_PROJECT_ID_INPUT" >> $GITHUB_OUTPUT
+          echo "featured_input=$FEATURED_INPUT" >> $GITHUB_OUTPUT
+          echo "changelog_type_input=$CHANGELOG_TYPE_INPUT" >> $GITHUB_OUTPUT
+
+      - name: Auto-detect resourcepack path (if needed)
+        id: detect
+        run: |
+          set -euo pipefail
+          INPUT="${{ steps.inputs.outputs.resourcepack_input }}"
+          if [ -n "$INPUT" ] && [ -d "$INPUT" ]; then
+            echo "Using provided resource-pack path: $INPUT"
+            echo "resourcepack_path=$INPUT" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          mapfile -d '' pmfiles < <(find . -type f -name 'pack.mcmeta' -print0 || true)
+          if [ "${#pmfiles[@]}" -eq 1 ]; then
+            p="${pmfiles[0]}"
+            dir="$(dirname "$p")"
+            dir="${dir#./}"
+            echo "Auto-detected resource-pack path from pack.mcmeta: $dir"
+            echo "resourcepack_path=$dir" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "${#pmfiles[@]}" -gt 1 ]; then
+            echo "Multiple pack.mcmeta files found:"
+            for f in "${pmfiles[@]}"; do echo " - ${f#./}"; done
+            echo "Please provide resourcepack_path input to disambiguate."
+            exit 1
+          fi
+
+          echo "ERROR: could not find pack.mcmeta to auto-detect a resource pack."
+          exit 1
+
+      - name: Determine version string
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION_INPUT="${{ steps.inputs.outputs.version_input }}"
+          if [ -n "$VERSION_INPUT" ]; then
+            VERSION="$VERSION_INPUT"
+            echo "Using version from input: $VERSION"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Prefer tag when available; fallback to release name when triggered by a release
+          if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+            TAG="$(jq -r '.release.tag_name // empty' "$GITHUB_EVENT_PATH")"
+            RELEASE_NAME="$(jq -r '.release.name // empty' "$GITHUB_EVENT_PATH")"
+            if [ -n "$TAG" ]; then
+              VERSION="${TAG#v}"
+              echo "Detected release event with tag: $TAG -> version $VERSION"
+              echo "version=$VERSION" >> $GITHUB_OUTPUT
+              exit 0
+            elif [ -n "$RELEASE_NAME" ]; then
+              VERSION="$RELEASE_NAME"
+              echo "Detected release event with name: $RELEASE_NAME -> version $VERSION"
+              echo "version=$VERSION" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${RAW_TAG#v}"
+            echo "Detected tag push: $RAW_TAG -> version $VERSION"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          VERSION="$(git rev-parse --short HEAD)"
+          echo "No tag or release name found; falling back to commit SHA: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create zip of resource pack
+        id: package
+        run: |
+          set -euo pipefail
+          RESOURCEPACK_PATH="${{ steps.detect.outputs.resourcepack_path }}"
+          echo "Detected resource-pack path: $RESOURCEPACK_PATH"
+          if [ -z "$RESOURCEPACK_PATH" ]; then
+            echo "ERROR: resourcepack path is empty."
+            exit 1
+          fi
+
+          REPO_SAFE="${GITHUB_REPOSITORY//\//-}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Sanitize VERSION for filenames (replace spaces and unsafe chars with '-')
+          FILENAME_VERSION="$(printf '%s' "$VERSION" | tr ' ' '-' | sed 's/[^A-Za-z0-9._-]/-/g')"
+          ZIP_NAME="${REPO_SAFE}-resourcepack-${FILENAME_VERSION}.zip"
+
+          rm -f "$GITHUB_WORKSPACE/$ZIP_NAME"
+
+          # If the detected path is root (.), package only the resource-pack files (pack.mcmeta + assets/)
+          if [ "$RESOURCEPACK_PATH" = "." ] || [ "$RESOURCEPACK_PATH" = "$GITHUB_WORKSPACE" ] || [ "$RESOURCEPACK_PATH" = "$(basename "$GITHUB_WORKSPACE")" ]; then
+            echo "Packaging pack.mcmeta and assets/ from repository root as resource pack"
+            (cd "$GITHUB_WORKSPACE" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" pack.mcmeta assets -x "*.git*" ) || { echo "zip failed"; exit 1; }
+          else
+            echo "Packaging entire detected path: $RESOURCEPACK_PATH"
+            (cd "$RESOURCEPACK_PATH" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" . -x "*.git*" ) || { echo "zip failed"; exit 1; }
+          fi
+
+          echo "zip=$ZIP_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload zip as artifact (for auditing/debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: resourcepack-zip
+          path: ${{ github.workspace }}/${{ steps.package.outputs.zip }}
+
+      - name: Compute SHA256 of generated zip
+        id: compute_sha
+        run: |
+          set -euo pipefail
+          ZIP_NAME="${{ steps.package.outputs.zip }}"
+          ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_NAME"
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "Zip file not found: $ZIP_PATH"
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHA256_VAL="$(sha256sum "$ZIP_PATH" | awk '{print $1}')"
+          else
+            SHA256_VAL="$(openssl dgst -sha256 "$ZIP_PATH" | awk '{print $2}')"
+          fi
+          echo "sha256=$SHA256_VAL" >> $GITHUB_OUTPUT
+
+      - name: Attach zip to GitHub release (when release published)
+        if: ${{ github.event_name == 'release' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ZIP_NAME="${{ steps.package.outputs.zip }}"
+          ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_NAME"
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "Zip file not found: $ZIP_PATH"
+            exit 1
+          fi
+
+          if [ -f "$GITHUB_EVENT_PATH" ]; then
+            UPLOAD_URL_RAW="$(jq -r '.release.upload_url // empty' "$GITHUB_EVENT_PATH")"
+            if [ -z "$UPLOAD_URL_RAW" ]; then
+              echo "Could not read release.upload_url from event payload; skipping release asset upload."
+              exit 0
+            fi
+            # Trim the templated part: e.g. https://uploads.github.com/...{?name,label}
+            UPLOAD_URL="$(printf '%s' "$UPLOAD_URL_RAW" | sed -e 's/{.*}//')"
+            echo "Uploading $ZIP_NAME to GitHub release via $UPLOAD_URL"
+            curl -sS -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/zip" --data-binary "@$ZIP_PATH" "$UPLOAD_URL?name=$(basename "$ZIP_PATH")" || { echo "upload failed"; exit 1; }
+          else
+            echo "No GITHUB_EVENT_PATH; not a release event; skipping upload to release."
+          fi
+
+      - name: Create GitHub release and attach zip (if requested)
+        id: create_release
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (steps.inputs.outputs.create_github_release == 'true' && github.event_name != 'release') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ZIP_NAME="${{ steps.package.outputs.zip }}"
+          ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_NAME"
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "Zip file not found: $ZIP_PATH"
+            exit 1
+          fi
+
+          # Build changelog/body for the release (prefer explicit input override, then CHANGELOG.md, then pack.mcmeta description)
+          BODY=""
+          if [ -n "${{ steps.inputs.outputs.changelog_override }}" ]; then
+            BODY="${{ steps.inputs.outputs.changelog_override }}"
+          elif [ -f CHANGELOG.md ]; then
+            BODY="$(cat CHANGELOG.md)"
+          elif [ -f "${{ steps.detect.outputs.resourcepack_path }}/pack.mcmeta" ]; then
+            DESC="$(jq -r '.pack.description // empty' "${{ steps.detect.outputs.resourcepack_path }}/pack.mcmeta" 2>/dev/null || true)"
+            if [ -n "$DESC" ]; then
+              BODY="$DESC"
+            fi
+          fi
+          if [ -z "$BODY" ]; then
+            BODY="Automated release for version ${{ steps.version.outputs.version }}"
+          fi
+          # append computed checksum if available
+          if [ -n "${{ steps.compute_sha.outputs.sha256 }}" ]; then
+            BODY="$BODY\n\n**SHA256:** ${{ steps.compute_sha.outputs.sha256 }}"
+          fi
+
+          # Determine tag to use for the release
+          TAG=""
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            # Use version with a 'v' prefix when creating a tag
+            RAW_VER="${{ steps.version.outputs.version }}"
+            # sanitize tag (no spaces)
+            TAG="v$(printf '%s' "$RAW_VER" | tr ' ' '-')"
+          fi
+
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+
+          # Check whether a release for this tag already exists
+          HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${OWNER_REPO}/releases/tags/${TAG}" || true)"
+          if [ "$HTTP" = "200" ]; then
+            echo "Release for tag ${TAG} already exists. Retrieving upload_url..."
+            RELEASE_JSON="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${OWNER_REPO}/releases/tags/${TAG}")"
+            UPLOAD_URL_RAW="$(printf '%s' "$RELEASE_JSON" | jq -r '.upload_url // empty')"
+            UPLOAD_URL="$(printf '%s' "$UPLOAD_URL_RAW" | sed -e 's/{.*}//')"
+            # Extract canonical name/tag from existing release
+            EXIST_NAME="$(printf '%s' "$RELEASE_JSON" | jq -r '.name // empty' || true)"
+            EXIST_TAG="$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name // empty' || true)"
+            if [ -n "$EXIST_TAG" ]; then
+              echo "release_tag=$EXIST_TAG" >> $GITHUB_OUTPUT
+            fi
+            if [ -n "$EXIST_NAME" ]; then
+              echo "release_name=$EXIST_NAME" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Creating new GitHub release for tag ${TAG}"
+            PRERELEASE="false"
+            if [ "${{ steps.inputs.outputs.version_type }}" != "release" ]; then
+              PRERELEASE="true"
+            fi
+            # Compute release name to match the Modrinth version name logic.
+            # Prefer explicit `release_name` input, else use repo + tag as a fallback.
+            REPO_NAME="${GITHUB_REPOSITORY##*/}"
+            if [ -n "${{ steps.inputs.outputs.release_name_input }}" ]; then
+              RELEASE_NAME_TO_USE="${{ steps.inputs.outputs.release_name_input }}"
+            else
+              RELEASE_NAME_TO_USE="${REPO_NAME} ${TAG}"
+            fi
+
+            CREATE_JSON="$(jq -c -n --arg tag_name "$TAG" --arg name "$RELEASE_NAME_TO_USE" --arg body "$BODY" --argjson prerelease "$PRERELEASE" '{ tag_name: $tag_name, name: $name, body: $body, draft: false, prerelease: ($prerelease == "true") }')"
+            echo "CREATE_JSON: $CREATE_JSON" >&2
+            RESP="$(curl -sS -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/json" -d "$CREATE_JSON" "https://api.github.com/repos/${OWNER_REPO}/releases")"
+            UPLOAD_URL_RAW="$(printf '%s' "$RESP" | jq -r '.upload_url // empty')"
+            UPLOAD_URL="$(printf '%s' "$UPLOAD_URL_RAW" | sed -e 's/{.*}//')"
+            # Output created release info for downstream steps
+            NEW_TAG="$(printf '%s' "$RESP" | jq -r '.tag_name // empty' || true)"
+            NEW_NAME="$(printf '%s' "$RESP" | jq -r '.name // empty' || true)"
+            if [ -n "$NEW_TAG" ]; then
+              echo "release_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+            else
+              echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+            fi
+            if [ -n "$NEW_NAME" ]; then
+              echo "release_name=$NEW_NAME" >> $GITHUB_OUTPUT
+            else
+              echo "release_name=$RELEASE_NAME_TO_USE" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Could not determine upload_url for release; skipping release asset upload."
+            exit 0
+          fi
+
+          echo "Uploading $ZIP_NAME to release via $UPLOAD_URL"
+          curl -sS -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/zip" --data-binary "@$ZIP_PATH" "$UPLOAD_URL?name=$(basename "$ZIP_PATH")" || { echo "upload failed"; exit 1; }
+
+      - name: Publish to Modrinth
+        id: publish_modrinth
+        env:
+          MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          API_URL="https://api.modrinth.com/v2/version"
+          # Allow override of the Modrinth project id via workflow input
+          if [ -n "${{ steps.inputs.outputs.modrinth_project_id_input || '' }}" ]; then
+            PROJECT_ID="${{ steps.inputs.outputs.modrinth_project_id_input }}"
+          else
+            PROJECT_ID="${MODRINTH_PROJECT_ID}"
+          fi
+          ZIP_NAME="${{ steps.package.outputs.zip }}"
+          ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_NAME"
+          VERSION="${{ steps.version.outputs.version }}"
+          GAME_VERSIONS_RAW="${{ steps.inputs.outputs.game_versions }}"
+          CHANGELOG_OVERRIDE="${{ steps.inputs.outputs.changelog_override }}"
+          VERSION_TYPE="${{ steps.inputs.outputs.version_type }}"
+          CREATE_GH_RELEASE="${{ steps.inputs.outputs.create_github_release }}"
+          DRY_RUN="${{ steps.inputs.outputs.dry_run }}"
+          FEATURED_RAW="${{ steps.inputs.outputs.featured_input || 'false' }}"
+          CHANGELOG_TYPE_RAW="${{ steps.inputs.outputs.changelog_type_input || 'markdown' }}"
+
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "ERROR: zip file not found at $ZIP_PATH"
+            exit 1
+          fi
+
+          # Guard: if this run is a push tag and a GitHub release for this tag already exists,
+          # skip to avoid double uploads (push->tag then release.published both fire).
+          if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" || true)"
+            if [ "$HTTP" = "200" ]; then
+              echo "A GitHub release for tag ${TAG} already exists. Skipping upload to avoid duplicate."
+              exit 0
+            fi
+          fi
+
+          # Build changelog: prefer explicit override > GitHub release body (if available) > release by tag > CHANGELOG.md > pack.mcmeta description > default
+          if [ -n "$CHANGELOG_OVERRIDE" ]; then
+            CHANGELOG="$CHANGELOG_OVERRIDE"
+          else
+            if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+              CHANGELOG="$(jq -r '.release.body // empty' "$GITHUB_EVENT_PATH" || true)"
+            fi
+
+            if [ -z "${CHANGELOG:-}" ] && [[ "${GITHUB_REF:-}" == refs/tags/* || -n "${{ steps.version.outputs.version }}" ]]; then
+              TAG="${GITHUB_REF#refs/tags/}"
+              if [ -z "$TAG" ] || [ "$TAG" = "${GITHUB_REF:-}" ]; then
+                TAG="${VERSION}"
+              fi
+              OWNER_REPO="${GITHUB_REPOSITORY}"
+              GH_API_URL="https://api.github.com/repos/${OWNER_REPO}/releases/tags/${TAG}"
+              RELEASE_BODY="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "${GH_API_URL}" | jq -r '.body // empty' 2>/dev/null || true)"
+              if [ -n "$RELEASE_BODY" ]; then
+                CHANGELOG="$RELEASE_BODY"
+              fi
+            fi
+
+            if [ -z "${CHANGELOG:-}" ]; then
+              if [ -f CHANGELOG.md ]; then
+                CHANGELOG="$(cat CHANGELOG.md)"
+              elif [ -f "${{ steps.detect.outputs.resourcepack_path }}/pack.mcmeta" ]; then
+                DESC="$(jq -r '.pack.description // empty' "${{ steps.detect.outputs.resourcepack_path }}/pack.mcmeta" 2>/dev/null || true)"
+                if [ -n "$DESC" ]; then
+                  CHANGELOG="$DESC"
+                fi
+              fi
+            fi
+
+            if [ -z "${CHANGELOG:-}" ]; then
+              CHANGELOG="Automated upload from GitHub Actions for version ${VERSION}"
+            fi
+            # Append checksum if available
+            if [ -n "${{ steps.compute_sha.outputs.sha256 || '' }}" ]; then
+              CHANGELOG="$CHANGELOG\n\n**SHA256:** ${{ steps.compute_sha.outputs.sha256 }}"
+            fi
+          fi
+
+          # Normalize token: allow secret to be stored either with or without leading "mrp_"
+          TOKEN="${MODRINTH_API_TOKEN}"
+          if [[ "$TOKEN" != mrp_* ]]; then
+            TOKEN="mrp_${TOKEN}"
+          fi
+
+          # Build JSON arrays robustly and output compact JSON (-c).
+          # Determine release/tag/title/body for Modrinth fields.
+          # Prefer explicit GitHub release payload when available, then prefer the release created by this workflow (if any),
+          # then fallback to tag ref or previously-determined version.
+          RELEASE_TAG=""
+          RELEASE_TITLE=""
+          RELEASE_BODY=""
+
+          # If workflow run was triggered by a release event, use the event payload
+          if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+            RELEASE_TAG="$(jq -r '.release.tag_name // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+            RELEASE_TITLE="$(jq -r '.release.name // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+            RELEASE_BODY="$(jq -r '.release.body // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+          fi
+
+          # If we created or found a release earlier in the job, prefer its outputs
+          if [ -n "${{ steps.create_release.outputs.release_tag || '' }}" ]; then
+            RELEASE_TAG="${{ steps.create_release.outputs.release_tag }}"
+          fi
+          if [ -n "${{ steps.create_release.outputs.release_name || '' }}" ]; then
+            RELEASE_TITLE="${{ steps.create_release.outputs.release_name }}"
+          fi
+
+          # If still empty, use the tag ref when present
+          if [ -z "$RELEASE_TAG" ] && [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # As a final fallback, use the earlier-determined VERSION
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="$VERSION"
+          fi
+
+          # If we don't have a release title/body yet but we do have a tag, try to fetch the GitHub release by tag
+          if [ -z "$RELEASE_TITLE" ] || [ -z "$RELEASE_BODY" ]; then
+            if [ -n "$RELEASE_TAG" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+              GH_API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+              RESP="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "$GH_API_URL" || true)"
+              # only populate if valid JSON with expected fields
+              if echo "$RESP" | jq -e '.name? // .body? // empty' >/dev/null 2>&1; then
+                if [ -z "$RELEASE_TITLE" ]; then
+                  RELEASE_TITLE="$(echo "$RESP" | jq -r '.name // empty' || true)"
+                fi
+                if [ -z "$RELEASE_BODY" ]; then
+                  RELEASE_BODY="$(echo "$RESP" | jq -r '.body // empty' || true)"
+                fi
+              fi
+            fi
+          fi
+
+          # Use release title if present, else fall back to repo+tag
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          if [ -n "$RELEASE_TITLE" ]; then
+            MODRINTH_NAME="$RELEASE_TITLE"
+          else
+            MODRINTH_NAME="${REPO_NAME} ${RELEASE_TAG}"
+          fi
+
+          # Use release body if present, else existing changelog
+          if [ -n "$RELEASE_BODY" ]; then
+            MODRINTH_CHANGELOG="$RELEASE_BODY"
+          else
+            MODRINTH_CHANGELOG="$CHANGELOG"
+          fi
+
+          # Determine game versions from pack.mcmeta when available, else fall back to input.
+          # Use pack.min_format/max_format when present (newer format), otherwise use pack.pack_format.
+          RESOURCEPACK_PATH="${{ steps.detect.outputs.resourcepack_path }}"
+          GAME_JSON=""
+
+          map_pack_format_to_version() {
+            pf="$1"
+            # Map representative pack_format numbers to Minecraft game version strings (based on https://minecraft.wiki/w/Pack_format)
+            case "$pf" in
+              1) echo '"1.6.1"' ;;
+              2) echo '"1.9"' ;;
+              3) echo '"1.11"' ;;
+              4) echo '"1.13"' ;;
+              5) echo '"1.15"' ;;
+              6) echo '"1.16.2"' ;;
+              7) echo '"1.17"' ;;
+              8) echo '"1.18"' ;;
+              9) echo '"1.19"' ;;
+              10) echo '"1.19.3"' ;;
+              11) echo '"1.19.3"' ;;
+              12) echo '"1.19.3"' ;;
+              13) echo '"1.19.4"' ;;
+              14) echo '"1.20"' ;;
+              15) echo '"1.20"' ;;
+              16) echo '"1.20.2"' ;;
+              17) echo '"1.20.2"' ;;
+              18) echo '"1.20.2"' ;;
+              21) echo '"1.20.3"' ;;
+              22) echo '"1.20.3"' ;;
+              26) echo '"1.20.4"' ;;
+              31) echo '"1.20.5"' ;;
+              32) echo '"1.20.5"' ;;
+              34) echo '"1.21"' ;;
+              42) echo '"1.21.2"' ;;
+              46) echo '"1.21.4"' ;;
+              48) echo '"1.21.4"' ;;
+              55) echo '"1.21.5"' ;;
+              63) echo '"1.21.6"' ;;
+              64) echo '"1.21.7"' ;;
+              69) echo '"1.21.9"' ;;
+              75) echo '"1.21.11"' ;;
+              80) echo '"1.21.6"' ;;
+              81) echo '"1.21.7"' ;;
+              88|"88.0") echo '"1.21.9"' ;;
+              *)
+                # Unknown pack_format: fall back to input game_versions
+                return 1
+                ;;
+            esac
+            return 0
+          }
+
+          if [ -n "$RESOURCEPACK_PATH" ] && [ -f "$RESOURCEPACK_PATH/pack.mcmeta" ]; then
+            # Prefer min_format/max_format if present (newer pack.mcmeta schema)
+            MINF="$(jq -r '.pack.min_format // empty' "$RESOURCEPACK_PATH/pack.mcmeta" 2>/dev/null || true)"
+            MAXF="$(jq -r '.pack.max_format // empty' "$RESOURCEPACK_PATH/pack.mcmeta" 2>/dev/null || true)"
+            PACKF="$(jq -r '.pack.pack_format // empty' "$RESOURCEPACK_PATH/pack.mcmeta" 2>/dev/null || true)"
+
+            if [ -n "$MINF" ] && [ -n "$MAXF" ]; then
+              # Map both bounds to representative versions if possible; if mapping fails, skip
+              if map_pack_format_to_version "$MINF" >/dev/null 2>&1 && map_pack_format_to_version "$MAXF" >/dev/null 2>&1; then
+                MIN_V="$(map_pack_format_to_version "$MINF")"
+                MAX_V="$(map_pack_format_to_version "$MAXF")"
+                # build JSON array from both (unique)
+                GAME_JSON="$(jq -c -n --arg a "$MIN_V" --arg b "$MAX_V" '[($a|fromjson),($b|fromjson)] | unique')"
+              fi
+            elif [ -n "$PACKF" ]; then
+              if map_pack_format_to_version "$PACKF" >/dev/null 2>&1; then
+                V="$(map_pack_format_to_version "$PACKF")"
+                GAME_JSON="$(jq -c -n --arg v "$V" '[($v|fromjson)]')"
+              fi
+            fi
+          fi
+
+          if [ -z "$GAME_JSON" ]; then
+            GAME_JSON="$(printf '%s' "$GAME_VERSIONS_RAW" | jq -R -s 'split(",") | map(.|gsub("^\\s+|\\s+$";"")) | map(select(length>0))')"
+          fi
+
+          # Resource packs always use the Minecraft loader
+          LOADERS_JSON='["minecraft"]'
+
+          # Modrinth version_number should match the GitHub release tag exactly
+          VERSION_NUMBER_FOR_MODRINTH="$RELEASE_TAG"
+
+          DATA_JSON="$(jq -c -n \
+            --arg project_id "${PROJECT_ID}" \
+            --arg name "$MODRINTH_NAME" \
+            --arg version_number "$VERSION_NUMBER_FOR_MODRINTH" \
+            --arg changelog "$MODRINTH_CHANGELOG" \
+            --argjson game_versions "${GAME_JSON}" \
+            --argjson loaders "${LOADERS_JSON}" \
+            --arg version_type "${VERSION_TYPE}" \
+              --arg changelog_type "${CHANGELOG_TYPE_RAW}" \
+              --argjson featured ${FEATURED_RAW} \
+              '{
+              project_id: $project_id,
+              name: $name,
+              version_number: $version_number,
+              changelog: $changelog,
+                changelog_type: $changelog_type,
+              game_versions: $game_versions,
+              loaders: $loaders,
+              dependencies: [],
+              file_parts: ["file"],
+              primary_file: "file",
+                version_type: $version_type,
+                featured: $featured
+            }')"
+
+          echo "DATA_JSON: $DATA_JSON" >&2
+
+          # Idempotency check: if a version with this version_number already exists for the project, try to detect same file (checksum),
+          # otherwise skip to avoid duplicate version_numbers
+          echo "Checking for existing versions for project..."
+          EXISTING="$(curl -sS -H "Authorization: ${TOKEN}" "https://api.modrinth.com/v2/project/${PROJECT_ID}/version" || true)"
+
+          # If there's any existing version with our version number, inspect files and compare checksums (optional).
+          if echo "$EXISTING" | jq -e --arg ver "$VERSION" '.[] | select(.version_number == $ver)' >/dev/null 2>&1; then
+            echo "Found existing version(s) with same version_number. Checking file checksums..."
+            # use precomputed checksum from earlier step
+            LOCAL_SHA256="${{ steps.compute_sha.outputs.sha256 }}"
+
+            MATCH=""
+            # iterate matching versions, fetch full version detail to inspect files/hashes
+            echo "$EXISTING" | jq -r --arg ver "$VERSION" '.[] | select(.version_number == $ver) | .id' | while read -r id; do
+              if [ -n "$id" ]; then
+                VER_JSON="$(curl -sS -H "Authorization: ${TOKEN}" "https://api.modrinth.com/v2/version/$id" || true)"
+                # Try to find sha256 in returned hashes; Modrinth may include sha1/sha512/sha256 keys depending on API; check common locations
+                # This attempts to find any file hash that equals LOCAL_SHA256
+                if echo "$VER_JSON" | jq -e --arg want "$LOCAL_SHA256" '.files[]?.hashes? | .. | select(type=="string") | select(. == $want)' >/dev/null 2>&1; then
+                  MATCH="$id"
+                  echo "Matching file found in existing Modrinth version: $id"
+                  echo "modrinth_version_id=$id" >> $GITHUB_OUTPUT
+                  echo "modrinth_version_url=https://modrinth.com/version/$id" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+              fi
+            done
+
+            if [ -n "$MATCH" ]; then
+              echo "An identical file already exists on Modrinth (version id: $MATCH). Skipping upload."
+              exit 0
+            fi
+
+            # If we got here, no identical file found, but a version_number collision exists — still skip to avoid duplicate versions.
+            echo "Version number '${VERSION}' already exists but files differ. To avoid duplicate version numbers, skipping upload. Consider bumping version."
+            EXIST_ID="$(echo "$EXISTING" | jq -r --arg ver "$VERSION" '.[] | select(.version_number == $ver) | .id' | head -n1)"
+            EXIST_URL="https://modrinth.com/version/${EXIST_ID}"
+            echo "Existing Modrinth version: ${EXIST_ID} -> ${EXIST_URL}"
+            echo "modrinth_version_id=${EXIST_ID}" >> $GITHUB_OUTPUT
+            echo "modrinth_version_url=${EXIST_URL}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run enabled; not uploading. Exiting success."
+            exit 0
+          fi
+
+          # Upload with retry/backoff
+          MAX_ATTEMPTS=3
+          attempt=0
+          RESPONSE=""
+          while [ $attempt -lt $MAX_ATTEMPTS ]; do
+            attempt=$((attempt + 1))
+            echo "Upload attempt ${attempt}..."
+            RESPONSE="$(curl -m 120 -sS -X POST \
+              -H "Authorization: ${TOKEN}" \
+              -H "User-Agent: ${GITHUB_REPOSITORY}-github-action/1.0" \
+              -F "data=${DATA_JSON};type=application/json" \
+              -F "file=@${ZIP_PATH}" \
+              "${API_URL}" || true)"
+            if ! echo "$RESPONSE" | jq -e 'has("error")' >/dev/null 2>&1; then
+              break
+            fi
+            echo "Upload failed (attempt ${attempt}). Response: $RESPONSE" >&2
+            sleep $((attempt * 5))
+          done
+
+          echo "Response: $RESPONSE"
+          if echo "$RESPONSE" | jq -e 'has("error")' >/dev/null 2>&1; then
+            echo "Modrinth API returned an error after ${attempt} attempts." >&2
+            echo "$RESPONSE" | jq -r '.description // .error // tostring' >&2 || true
+            exit 1
+          fi
+
+          VERSION_ID="$(echo "$RESPONSE" | jq -r '.id // empty')"
+          if [ -n "$VERSION_ID" ]; then
+            VERSION_URL="https://modrinth.com/version/${VERSION_ID}"
+            echo "Published Modrinth version id: $VERSION_ID"
+            echo "modrinth_version_id=${VERSION_ID}" >> $GITHUB_OUTPUT
+            echo "modrinth_version_url=${VERSION_URL}" >> $GITHUB_OUTPUT
+          else
+            echo "Upload succeeded but response did not include an id. Full response:" >&2
+            echo "$RESPONSE" >&2
+            exit 1
+          fi
+
+      - name: Success message
+        if: success()
+        run: |
+          echo "Resource pack process completed."
+          echo "Modrinth version id: ${{ steps.publish_modrinth.outputs.modrinth_version_id }}"
+          echo "Modrinth version URL: ${{ steps.publish_modrinth.outputs.modrinth_version_url }}"
