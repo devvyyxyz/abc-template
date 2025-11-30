@@ -15,9 +15,11 @@ Two short install flows below are split so you can quickly follow the one you ne
    - Location: `.minecraft/saves/[Your World Name]/datapacks/`
 3. In-game run `/reload` or restart the world. Verify `load.mcfunction` ran (use `say`/`tellraw` tests in `load.mcfunction`).
 
-Notes:
-- Datapacks must live in a world's `datapacks/` folder (not in `resourcepacks/`).
-- Keep `assets/` if you plan to also use resource assets locally; it won't interfere with datapack execution.
+> [!IMPORTANT]
+> Datapacks must live in a world's `datapacks/` folder (not in `resourcepacks/`). If you copy the whole repo, make sure you place it inside the world save `datapacks/` directory.
+
+> [!TIP]
+> Keep `assets/` in the repository during datapack development if you also use resource assets locally; it will not interfere with datapack execution and simplifies testing.
 
 ## Quick Install — Resource Pack
 
@@ -26,9 +28,11 @@ Notes:
    - Location: `~/.minecraft/resourcepacks/` (or `%appdata%/Roaming/.minecraft/resourcepacks/` on Windows)
 3. In Minecraft: Options → Resource Packs → Open Pack Folder (or use the resource pack menu) and enable the pack.
 
-Notes:
-- Resource packs use `assets/` and a `pack.mcmeta` that must include the resource pack's `pack_format`.
-- You can distribute a resource pack as a ZIP containing `assets/` and `pack.mcmeta`.
+> [!IMPORTANT]
+> Resource packs must be placed in Minecraft's `resourcepacks/` folder (not `datapacks/`). Ensure `pack.mcmeta` has the correct `pack_format` for the target Minecraft version.
+
+> [!TIP]
+> To distribute, create a ZIP containing `assets/` and `pack.mcmeta` (optionally `pack.png`) and share that as the resource pack.
 
 ## Quick Install — Combined / Development Workflow
 
@@ -36,6 +40,9 @@ If you want both datapack logic and resource assets during development, keep bot
 
 - Copy `data/` into your world's `datapacks/` and copy `assets/` into `~/.minecraft/resourcepacks/`.
 - Alternatively use the helper scripts included to move/backup unwanted directories automatically.
+
+> [!CAUTION]
+> Using the helper scripts will move or delete directories by design. The scripts create timestamped backups by default — review backups after running. Use `DRYRUN=1` when running via the `Makefile` to preview actions.
 
 ## What you will need — Datapack (key items)
 
@@ -48,6 +55,9 @@ Quick checklist:
 - Create/adjust `data/<namespace>/functions/load.mcfunction` for setup commands.
 - Add `data/minecraft/tags/functions/load.json` that references your namespace load function.
 
+> [!NOTE]
+> Datapack `pack_format` values are version-dependent. When in doubt, check the official Minecraft datapack documentation for the correct `pack_format` for your target versions.
+
 ## What you will need — Resource Pack (key items)
 
 - `assets/<namespace>/textures/` (or `assets/minecraft/textures/`) for images and models.
@@ -57,6 +67,9 @@ Quick checklist:
 Quick checklist:
 - Place textures under `assets/minecraft/textures/...` or under your namespace folder for namespaced assets.
 - Update `pack.mcmeta` with a resource pack `pack_format` compatible with your target Minecraft versions.
+
+> [!WARNING]
+> Resource pack `pack_format` differs from datapack `pack_format`. Using the wrong `pack_format` may prevent the pack from appearing or working correctly in some Minecraft versions.
 
 ## Files & Paths (summary)
 
@@ -99,11 +112,20 @@ chmod +x make-datapack.sh make-resourcepack.sh
 ./make-resourcepack.sh --delete   # permanently delete 'data'
 ```
 
+> [!WARNING]
+> The `--delete` option permanently removes files without creating a backup. Only use `--delete` if you are certain you do not need the removed directory.
+
+> [!TIP]
+> Use the Makefile dry-run mode to preview script actions without performing them: `make make-datapack DRYRUN=1` or `make make-resourcepack DRYRUN=1`.
+
 ## Recommended edits when starting a project
 
 - For datapacks: set your namespace, update `pack.mcmeta` pack_format, and document functions in `data/<namespace>/README.md`.
 - For resource packs: add `pack.png`, organize textures under `assets/`, and set the resource pack `pack_format`.
 - Use Git for version control and keep backups when deleting directories.
+
+> [!IMPORTANT]
+> Never commit API tokens, private keys, or other secrets into source. Use your Git hosting provider's encrypted secrets feature (e.g., GitHub Secrets) for CI workflows.
 
 ## Want me to do more?
 
