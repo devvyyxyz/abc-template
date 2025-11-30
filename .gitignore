@@ -22,3 +22,45 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+# Common OS/editor files
+.DS_Store
+Thumbs.db
+
+# Editor/workspace settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Backup/temp files
+*~
+*.bak
+*.swp
+*.tmp
+*.orig
+
+# Logs
+*.log
+
+# Node/npm
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# Build / distribution
+dist/
+build/
+*.zip
+*.tar.gz
+
+# Helper script backups created by make-datapack.sh / make-resourcepack.sh
+assets.backup*
+data.backup*
+
+# Secrets / env
+.env
+.env.local
+secrets.yml
