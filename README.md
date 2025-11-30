@@ -65,6 +65,24 @@ Quick checklist:
 - `assets/`: resource pack content (textures, models, sounds).
 - `README.md`, `LICENSE`, `pack.png`: docs, license, and optional icon.
 
+## What's included and what isn't
+
+Included in this template:
+
+- `data/` — a minimal datapack namespace (`abc`) with `functions/load`, `tick`, `example` and `tests/` scaffolding.
+- `assets/` — a minimal resource-pack structure and `README.md` with `.gitkeep` in `assets/minecraft/textures/` so the folder is preserved in Git.
+- `Makefile` — convenience targets to run helper scripts safely (includes `DRYRUN` and confirmation behavior).
+- `make-datapack.sh` / `make-resourcepack.sh` — helpers to move or delete directories with backups by default.
+- `.gitignore` — updated with sensible defaults for development and helper-script backups.
+
+Not included (by design):
+
+- Full build tooling (Gradle, Maven, npm) — this template is intentionally lightweight and does not include language-specific build systems.
+- Binary or compiled artifacts — compiled mod JARs or exported zipped releases are not stored here.
+- CI workflows — sample workflow filenames and descriptions are suggested below, but workflow files are not included by default.
+
+If you want any of the above added (for example a Gradle wrapper or a GitHub Actions workflow), tell me which and I can scaffold it.
+
 ## Helper scripts
 
 Two scripts are included to help convert the repo into the variant you want:
